@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+#
+# bump-version - increment the systeminfo version (semver) in one place.
+#
+# The version lives in `__version__` inside the `systeminfo` script and in the
+# changelog table in README.md. This helper bumps the code version and, when a
+# message is given, prepends a changelog row.
+#
+# Version scheme (semver): MAJOR.MINOR.PATCH
+#   major | 1 | stora  -> large / breaking changes
+#   minor | 2 | medel  -> medium changes (new features, backward compatible)
+#   patch | 3 | sma    -> small changes (bug fixes)
+#
+# Usage:
+#   ./bump-version <major|minor|patch | 1|2|3 | stora|medel|sma> ["changelog message"]
+#
+# Examples:
+#   ./bump-version minor "Add swap usage"
+#   ./bump-version 3 "Fix IPv6 parsing on down interfaces"
+#   ./bump-version patch          # bump code version only, no changelog row
+
+set -euo pipefail
+
+# Resolve paths relative to this script so it works from any CWD.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
+readonly TARGET="${SCRIPT_DIR}/systeminfo"
+readonly README="${SCRIPT_DIR}/README.md"
+
+die() {
+    printf 'bump-version: %s\n' "$1" >&2
+    exit "${2:-1}"
+}
+
+usage() {
+    grep -E '^#( |$)' "${BASH_SOURCE[0]}" | sed -E 's/^# ?//' >&2
+    exit "${1:-2}"
+}
+
+[[ $# -ge 1 ]] || usage 2
+
+part_raw="$1"
+message="${2:-}"
+
+# Normalize the requested bump level to major/minor/patch.
+case "${part_raw,,}" in
+    major|1|stora) part="major" ;;
+    minor|2|medel) part="minor" ;;
+    patch|3|sma|små) part="patch" ;;
+    -h|--help)     usage 0 ;;
+    *) die "unknown bump level: '${part_raw}' (use major|minor|patch or 1|2|3)" ;;
+esac
+
+[[ -f "$TARGET" ]] || die "target not found: ${TARGET}"
+[[ -w "$TARGET" ]] || die "target not writable: ${TARGET}"
+
+# Extract the current version. Fail loudly if it is missing or malformed.
+current="$(grep -Po '^__version__ = "\K[0-9]+\.[0-9]+\.[0-9]+(?=")' "$TARGET" || true)"
+[[ -n "$current" ]] || die "could not find a valid __version__ = \"X.Y.Z\" in ${TARGET}"
+
+IFS='.' read -r major minor patch <<< "$current"
+
+case "$part" in
+    major) major=$((major + 1)); minor=0; patch=0 ;;
+    minor) minor=$((minor + 1)); patch=0 ;;
+    patch) patch=$((patch + 1)) ;;
+esac
+new="${major}.${minor}.${patch}"
+
+[[ "$new" != "$current" ]] || die "new version equals current (${current}); nothing to do"
+
+# --- Update the code version atomically (temp file + mv) ---
+tmp_target="$(mktemp -- "${TARGET}.XXXXXX")"
+trap 'rm -f -- "$tmp_target"' EXIT
+sed -E "s/^__version__ = \"[0-9]+\.[0-9]+\.[0-9]+\"/__version__ = \"${new}\"/" \
+    "$TARGET" > "$tmp_target"
+
+# Verify the replacement actually happened before committing to it.
+grep -qF "__version__ = \"${new}\"" "$tmp_target" \
+    || die "version replacement failed; ${TARGET} left unchanged"
+
+cat "$tmp_target" > "$TARGET"   # preserve original mode/permissions/inode
+rm -f -- "$tmp_target"
+trap - EXIT
+
+printf 'Bumped %s: %s -> %s\n' "$part" "$current" "$new"
+
+# --- Optionally prepend a changelog row to README.md ---
+if [[ -n "$message" ]]; then
+    if [[ ! -f "$README" || ! -w "$README" ]]; then
+        printf 'bump-version: README not writable, skipped changelog: %s\n' \
+            "$README" >&2
+    else
+        tmp_readme="$(mktemp -- "${README}.XXXXXX")"
+        trap 'rm -f -- "$tmp_readme"' EXIT
+        # Insert the new row right after the changelog table's separator line
+        # (the "|---|---|" that immediately follows the "| Version | Change" head).
+        # Column widths are derived from the separator so the new row is padded
+        # to match the existing table exactly. Message passed via the
+        # environment to avoid awk -v backslash interpretation.
+        if BUMP_VER="$new" BUMP_MSG="$message" awk '
+            /^\|[- |]+\|[[:space:]]*$/ && prev ~ /^\|[[:space:]]*Version[[:space:]]*\|/ {
+                print                            # keep the separator line
+                split($0, cols, "|")             # cols[2], cols[3] = column rules
+                w1 = length(cols[2]); w2 = length(cols[3])
+                c1 = " " ENVIRON["BUMP_VER"]
+                while (length(c1) < w1) c1 = c1 " "
+                c2 = " " ENVIRON["BUMP_MSG"]
+                while (length(c2) < w2) c2 = c2 " "
+                print "|" c1 "|" c2 "|"
+                inserted = 1; prev = $0; next
+            }
+            { print; prev = $0 }
+            END { exit(inserted ? 0 : 3) }
+        ' "$README" > "$tmp_readme"; then
+            cat "$tmp_readme" > "$README"
+            printf 'Added changelog entry to %s\n' "$(basename "$README")"
+        else
+            printf 'bump-version: changelog table not found in README; row not added\n' >&2
+        fi
+        rm -f -- "$tmp_readme"
+        trap - EXIT
+    fi
+else
+    printf 'No changelog message given; README changelog not updated.\n' >&2
+fi
+
+printf 'Done. Review with: git diff\n'
