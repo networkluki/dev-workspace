@@ -1,68 +1,44 @@
 # dev-workspace
 
-Personal collection of commands, scripts, CLI tools, automation and developer utilities.
+`dev-workspace` is a curated collection for practical development work involving
+CLI tools, scripts, automation, Linux, DevOps, networking, security, and general
+software development.
 
-This repository is my development workspace for building, testing, documenting and experimenting with tools related to Linux, DevOps, system administration, networking, security and software development.
+The repository currently provides an organized foundation for future additions.
+Tools and examples will be documented as they are added; the directory names
+below describe their intended scope and do not imply that implementations already
+exist.
 
-> Build it. Test it. Automate it. Improve it.
+## Repository structure
 
-## Contents
+| Path | Intended content |
+| --- | --- |
+| `bash/` | Bash scripts and shell-oriented utilities |
+| `python/` | Python command-line tools and automation |
+| `powershell/` | PowerShell scripts and modules |
+| `go/` | Go command-line applications and packages |
+| `linux/` | Linux-specific commands, configuration examples, and operations notes |
+| `windows/` | Windows-specific commands, configuration examples, and operations notes |
+| `docker/` | Dockerfiles, Compose examples, and container tooling |
+| `git/` | Git helpers and workflow notes |
+| `snippets/` | Small, reusable command and code snippets |
+| `docs/` | Longer-form documentation that applies across the repository |
+| `experiments/` | Clearly identified exploratory work that is not production-ready |
 
-This repository may contain:
+## Using this repository
 
-- Custom CLI tools
-- Bash scripts
-- Python utilities
-- PowerShell scripts
-- Go tools
-- Linux commands
-- Windows commands
-- DevOps automation
-- Server administration tools
-- Networking utilities
-- Security utilities
-- Git helpers
-- Docker tools
-- systemd services and timers
-- Configuration examples
-- Development experiments
-- Useful command snippets
+Review a file and its documentation before running it. Scripts, commands, and
+configuration can have environment-specific effects, particularly when they
+involve system administration, networking, security, or containers. Never commit
+credentials or sensitive environment details; use sanitized examples instead.
 
-## Repository Structure
+## Contributing
 
-```text
-dev-workspace/
-├── bash/
-│   ├── system/
-│   ├── network/
-│   ├── security/
-│   └── automation/
-│
-├── python/
-│   ├── cli/
-│   ├── network/
-│   ├── security/
-│   └── utilities/
-│
-├── powershell/
-│   ├── windows/
-│   ├── system/
-│   └── automation/
-│
-├── go/
-│   ├── cli/
-│   └── tools/
-│
-├── linux/
-│   ├── commands/
-│   ├── systemd/
-│   └── configuration/
-│
-├── windows/
-│   └── commands/
-│
-├── docker/
-├── git/
-├── snippets/
-├── docs/
-└── experiments/
+Keep additions focused and place them in the most specific directory. Document
+prerequisites, supported platforms, usage, and potentially destructive behavior
+alongside each substantial tool. Prefer examples with placeholder values over
+real hostnames, addresses, tokens, or credentials.
+
+## License
+
+This project is available under the [MIT License](LICENSE).
