@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""pause - a Linux/Python replica of the Windows CMD `pause` command.
+
+Prints a prompt and waits for a single keypress (any key), then continues.
+Mirrors the behaviour of Windows `pause`, including:
+
+  * Default message: "Press any key to continue . . ."
+  * Waits for ANY key, not just Enter.
+  * The prompt goes to stdout; the keypress is read from the controlling
+    terminal (/dev/tty), so `pause` still works inside a pipeline where
+    stdin/stdout are redirected.
+
+Exit codes:
+  0    a key was pressed (normal continue)
+  130  interrupted with Ctrl-C (SIGINT), by POSIX convention (128 + SIGINT)
+
+When no controlling terminal is available (e.g. run fully non-interactively
+with no tty at all), the command prints the prompt and returns immediately
+with exit code 0, matching the "nothing to wait on" behaviour of Windows
+`pause` when input is redirected.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import termios
+import tty
+
+__version__ = "1.0.0"
+
+DEFAULT_MESSAGE = "Press any key to continue . . ."
+
+_CTRL_C = b"\x03"  # ETX: Ctrl-C is delivered as a raw byte while ISIG is off.
+
+EXIT_OK = 0
+EXIT_SIGINT = 130
+
+
+def _open_tty() -> tuple[int, bool]:
+    """Return (fd, should_close) for reading a keypress.
+
+    Prefers the controlling terminal (/dev/tty) so the command works even
+    when stdin is redirected. Falls back to stdin if it is itself a tty.
+    Returns fd == -1 when no terminal is available.
+    """
+    try:
+        fd = os.open("/dev/tty", os.O_RDONLY | os.O_NOCTTY)
+        return fd, True
+    except OSError:
+        pass
+
+    try:
+        if sys.stdin is not None and sys.stdin.isatty():
+            return sys.stdin.fileno(), False
+    except (OSError, ValueError):
+        pass
+
+    return -1, False
+
+
+def _read_single_key(fd: int) -> bytes:
+    """Read exactly one keypress from a terminal fd in raw mode.
+
+    Restores the original terminal attributes on exit, whatever happens.
+    Returns b"" on EOF.
+    """
+    old_attrs = termios.tcgetattr(fd)
+    try:
+        # Raw mode disables line buffering and signal generation (ISIG), so a
+        # single byte is returned immediately and Ctrl-C arrives as \x03.
+        tty.setraw(fd)
+        return os.read(fd, 1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+
+
+def wait_for_key(message: str = DEFAULT_MESSAGE, stream=sys.stdout) -> int:
+    """Print `message` and block until a single key is pressed.
+
+    Returns the intended process exit code.
+    """
+    # Write the prompt without a trailing newline, like Windows `pause`.
+    stream.write(message)
+    stream.flush()
+
+    fd, should_close = _open_tty()
+    ch = b""
+    try:
+        if fd == -1:
+            # No terminal to wait on: emit newline and continue immediately.
+            stream.write("\n")
+            stream.flush()
+            return EXIT_OK
+        try:
+            ch = _read_single_key(fd)
+        except (termios.error, OSError):
+            # Terminal turned out to be non-interactive/unusable.
+            stream.write("\n")
+            stream.flush()
+            return EXIT_OK
+    finally:
+        if should_close and fd != -1:
+            os.close(fd)
+
+    # Move to a fresh line so following output is not glued to the prompt.
+    stream.write("\n")
+    stream.flush()
+
+    # Ctrl-C is reported as an interrupt; any other key (and EOF) continues.
+    if ch == _CTRL_C:
+        return EXIT_SIGINT
+    return EXIT_OK
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="pause",
+        description="Wait for a single keypress, like the Windows `pause` command.",
+    )
+    parser.add_argument(
+        "-m",
+        "--message",
+        default=DEFAULT_MESSAGE,
+        help='prompt to display (default: "%(default)s")',
+    )
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        return wait_for_key(args.message)
+    except KeyboardInterrupt:
+        # Raised only if a SIGINT slips through before raw mode is active.
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        return EXIT_SIGINT
+
+
+if __name__ == "__main__":
+    sys.exit(main())

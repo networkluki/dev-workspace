@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""systeminfo - display Linux system information.
+
+Pure standard-library CLI tool for Linux servers. Reads /proc and /sys,
+degrades gracefully when a data source is unavailable, and never crashes
+on a single failed metric.
+
+Versioning (semver): MAJOR.MINOR.PATCH
+  MAJOR - large / breaking changes
+  MINOR - medium changes (new features, backward compatible)
+  PATCH - small changes (bug fixes)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import socket
+import struct
+import sys
+import time
+from datetime import datetime, timedelta
+
+try:
+    import fcntl  # Linux-only; used for interface IPv4 lookup via ioctl.
+except ImportError:
+    fcntl = None  # type: ignore[assignment]
+
+__version__ = "1.4.0"
+
+
+def _read_file(path: str) -> str | None:
+    """Read a text file, returning None on any error instead of raising."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def get_hostname() -> str:
+    try:
+        return socket.gethostname()
+    except OSError:
+        return "unknown"
+
+
+def get_os_info() -> dict[str, str]:
+    """Read /etc/os-release for a human-readable distribution name."""
+    info = {"name": "unknown", "version": ""}
+    content = _read_file("/etc/os-release")
+    if not content:
+        return info
+
+    fields: dict[str, str] = {}
+    for line in content.splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        fields[key.strip()] = value.strip().strip('"')
+
+    info["name"] = fields.get("PRETTY_NAME") or fields.get("NAME", "unknown")
+    info["version"] = fields.get("VERSION_ID", "")
+    return info
+
+
+def get_kernel() -> str:
+    return f"{platform.system()} {platform.release()}"
+
+
+def get_architecture() -> str:
+    return platform.machine() or "unknown"
+
+
+def get_uptime() -> float | None:
+    """Return system uptime in seconds from /proc/uptime."""
+    content = _read_file("/proc/uptime")
+    if not content:
+        return None
+    try:
+        return float(content.split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def get_cpu() -> dict[str, object]:
+    """Return CPU model name, logical core count, and load averages."""
+    info: dict[str, object] = {"model": "unknown", "cores": 0, "load": None}
+
+    content = _read_file("/proc/cpuinfo")
+    if content:
+        cores = 0
+        for line in content.splitlines():
+            if line.startswith("processor"):
+                cores += 1
+            elif line.startswith("model name") and info["model"] == "unknown":
+                info["model"] = line.split(":", 1)[1].strip()
+        info["cores"] = cores or os.cpu_count() or 0
+    else:
+        info["cores"] = os.cpu_count() or 0
+
+    try:
+        info["load"] = list(os.getloadavg())
+    except (OSError, AttributeError):
+        info["load"] = None
+
+    return info
+
+
+def get_memory() -> dict[str, int]:
+    """Return memory figures in bytes from /proc/meminfo."""
+    info = {"total": 0, "available": 0, "used": 0}
+    content = _read_file("/proc/meminfo")
+    if not content:
+        return info
+
+    values: dict[str, int] = {}
+    for line in content.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            key = parts[0].rstrip(":")
+            try:
+                values[key] = int(parts[1]) * 1024  # /proc/meminfo is in kB
+            except ValueError:
+                continue
+
+    info["total"] = values.get("MemTotal", 0)
+    info["available"] = values.get("MemAvailable", 0)
+    info["used"] = max(info["total"] - info["available"], 0)
+    return info
+
+
+def get_disk(path: str = "/") -> dict[str, int]:
+    """Return disk usage for the filesystem holding `path`, in bytes."""
+    try:
+        stat = os.statvfs(path)
+    except OSError:
+        return {"total": 0, "used": 0, "free": 0}
+
+    total = stat.f_frsize * stat.f_blocks
+    free = stat.f_frsize * stat.f_bavail
+    used = total - (stat.f_frsize * stat.f_bfree)
+    return {"total": total, "used": used, "free": free}
+
+
+_SIOCGIFADDR = 0x8915  # ioctl request to fetch an interface IPv4 address.
+
+
+def _get_ipv4(ifname: str) -> str | None:
+    """Return the primary IPv4 address of an interface via ioctl, or None."""
+    if fcntl is None:
+        return None
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        packed = struct.pack("256s", ifname[:15].encode("utf-8"))
+        res = fcntl.ioctl(sock.fileno(), _SIOCGIFADDR, packed)
+        return socket.inet_ntoa(res[20:24])
+    except OSError:
+        return None  # interface has no IPv4 assigned
+    finally:
+        sock.close()
+
+
+def _get_ipv6_map() -> dict[str, list[str]]:
+    """Map interface name -> IPv6 addresses parsed from /proc/net/if_inet6."""
+    result: dict[str, list[str]] = {}
+    content = _read_file("/proc/net/if_inet6")
+    if not content:
+        return result
+    for line in content.splitlines():
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        raw, ifname = parts[0], parts[5]
+        try:
+            addr = socket.inet_ntop(socket.AF_INET6, bytes.fromhex(raw))
+        except (ValueError, OSError):
+            continue
+        result.setdefault(ifname, []).append(addr)
+    return result
+
+
+def get_network_interfaces() -> list[dict[str, object]]:
+    """Enumerate network interfaces with MAC, state, and IP addresses."""
+    ipv6_map = _get_ipv6_map()
+    try:
+        names = sorted(os.listdir("/sys/class/net"))
+    except OSError:
+        return []
+
+    interfaces: list[dict[str, object]] = []
+    for name in names:
+        base = f"/sys/class/net/{name}"
+        mac = (_read_file(f"{base}/address") or "").strip() or None
+        state = (_read_file(f"{base}/operstate") or "").strip() or "unknown"
+        interfaces.append({
+            "name": name,
+            "mac": mac,
+            "state": state,
+            "ipv4": _get_ipv4(name),
+            "ipv6": ipv6_map.get(name, []),
+        })
+    return interfaces
+
+
+# glibc `struct utmp` is a fixed 384-byte record. Layout (little-endian,
+# no auto-alignment; the "xx" reproduces the pad after the leading short):
+#   ut_type(h) pad(xx) ut_pid(i) ut_line(32s) ut_id(4s) ut_user(32s)
+#   ut_host(256s) e_termination(h) e_exit(h) ut_session(i)
+#   tv_sec(i) tv_usec(i) ut_addr_v6(4i) __unused(20s)
+_UTMP_FORMAT = "<hxxi32s4s32s256shhiii4i20s"
+_UTMP_USER_PROCESS = 7  # ut_type value for an active user session.
+
+
+def _cstr(raw: bytes) -> str:
+    """Decode a NUL-terminated fixed-width C string field."""
+    return raw.split(b"\x00", 1)[0].decode("utf-8", "replace")
+
+
+def get_logged_in_users() -> list[dict[str, object]]:
+    """Return active user sessions parsed from the binary utmp database."""
+    record_size = struct.calcsize(_UTMP_FORMAT)
+
+    data = None
+    for path in ("/var/run/utmp", "/run/utmp"):
+        try:
+            with open(path, "rb") as handle:
+                data = handle.read()
+            break
+        except OSError:
+            continue
+    if not data:
+        return []
+
+    users: list[dict[str, object]] = []
+    for offset in range(0, len(data) - record_size + 1, record_size):
+        try:
+            fields = struct.unpack(_UTMP_FORMAT, data[offset:offset + record_size])
+        except struct.error:
+            continue
+        if fields[0] != _UTMP_USER_PROCESS:
+            continue
+        users.append({
+            "user": _cstr(fields[4]),
+            "tty": _cstr(fields[2]),
+            "host": _cstr(fields[5]) or None,
+            "login_time": int(fields[9]),
+        })
+    return users
+
+
+def collect() -> dict[str, object]:
+    """Gather all metrics into a single serializable structure."""
+    return {
+        "hostname": get_hostname(),
+        "os": get_os_info(),
+        "kernel": get_kernel(),
+        "architecture": get_architecture(),
+        "uptime_seconds": get_uptime(),
+        "cpu": get_cpu(),
+        "memory": get_memory(),
+        "disk": get_disk("/"),
+        "network": get_network_interfaces(),
+        "users": get_logged_in_users(),
+    }
+
+
+def _format_bytes(num: int) -> str:
+    """Human-readable size using binary (IEC) units."""
+    size = float(num)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if abs(size) < 1024.0:
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} EiB"
+
+
+def _format_uptime(seconds: float | None) -> str:
+    if seconds is None:
+        return "unknown"
+    delta = timedelta(seconds=int(seconds))
+    days = delta.days
+    hours, remainder = divmod(delta.seconds, 3600)
+    minutes, _ = divmod(remainder, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def _percent(part: int, whole: int) -> str:
+    if whole <= 0:
+        return "n/a"
+    return f"{(part / whole) * 100:.1f}%"
+
+
+def render_text(data: dict[str, object]) -> str:
+    os_info = data["os"]  # type: ignore[assignment]
+    cpu = data["cpu"]  # type: ignore[assignment]
+    mem = data["memory"]  # type: ignore[assignment]
+    disk = data["disk"]  # type: ignore[assignment]
+
+    load = cpu.get("load")
+    load_str = (
+        ", ".join(f"{v:.2f}" for v in load) if isinstance(load, list) else "n/a"
+    )
+
+    lines = [
+        f"Hostname     : {data['hostname']}",
+        f"OS           : {os_info.get('name', 'unknown')}",
+        f"Kernel       : {data['kernel']}",
+        f"Architecture : {data['architecture']}",
+        f"Uptime       : {_format_uptime(data['uptime_seconds'])}",
+        f"CPU          : {cpu.get('model', 'unknown')} ({cpu.get('cores', 0)} cores)",
+        f"Load avg     : {load_str}",
+        f"Memory       : {_format_bytes(mem['used'])} / "
+        f"{_format_bytes(mem['total'])} ({_percent(mem['used'], mem['total'])})",
+        f"Disk (/)     : {_format_bytes(disk['used'])} / "
+        f"{_format_bytes(disk['total'])} ({_percent(disk['used'], disk['total'])})",
+    ]
+
+    interfaces = data["network"]  # type: ignore[assignment]
+    lines.append("Interfaces   :" + ("" if interfaces else " none"))
+    for iface in interfaces:
+        addrs = []
+        if iface.get("ipv4"):
+            addrs.append(str(iface["ipv4"]))
+        addrs.extend(str(a) for a in iface.get("ipv6", []))
+        addr_str = ", ".join(addrs) if addrs else "-"
+        mac = iface.get("mac") or "-"
+        lines.append(
+            f"  {iface['name']:<12} {str(iface['state']):<7} {mac:<17} {addr_str}"
+        )
+
+    users = data["users"]  # type: ignore[assignment]
+    lines.append("Logged in    :" + ("" if users else " none"))
+    for user in users:
+        when = datetime.fromtimestamp(user["login_time"]).strftime("%Y-%m-%d %H:%M")
+        origin = f" from {user['host']}" if user.get("host") else ""
+        lines.append(f"  {user['user']}  ({user['tty']})  since {when}{origin}")
+
+    return "\n".join(lines)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="systeminfo",
+        description="Display Linux system information.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="output machine-readable JSON instead of formatted text",
+    )
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        data = collect()
+    except Exception as exc:  # defensive: never crash the CLI on collection
+        print(f"systeminfo: failed to collect system information: {exc}",
+              file=sys.stderr)
+        return 1
+
+    if args.json:
+        data["collected_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+    else:
+        print(render_text(data))
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
