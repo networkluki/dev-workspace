@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "assoc"
+description = "A Linux clone of the Windows 'assoc' command (extension -> MIME type)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["assoc", "mime", "file-association", "xdg", "freedesktop", "windows"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
+]
+dynamic = ["version"]
+
+[project.scripts]
+assoc = "assoc:main"
+
+[tool.setuptools]
+py-modules = ["assoc"]
+
+[tool.setuptools.dynamic]
+version = { attr = "assoc.__version__" }

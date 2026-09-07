@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clip-linux"
+version = "1.0.0"
+description = "A Linux port of the Windows 'clip' command: copy stdin to the system clipboard."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [{ name = "luki", email = "dev.networkluki@gmail.com" }]
+keywords = ["clipboard", "clip", "xclip", "wl-copy", "wayland", "x11", "cli"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/luki/clip-linux"
+Changelog = "https://github.com/luki/clip-linux/blob/main/CHANGELOG.md"
+
+[project.scripts]
+clip = "clip.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+clip = ["py.typed"]

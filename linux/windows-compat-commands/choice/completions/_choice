@@ -1,0 +1,49 @@
+#compdef choice
+# zsh completion for the "choice" command
+#
+# Install (choose one):
+#   1. System-wide (a directory already on $fpath):
+#        sudo cp completions/_choice /usr/share/zsh/site-functions/_choice
+#   2. Per user (add its directory to $fpath before `compinit` in ~/.zshrc):
+#        cp completions/_choice ~/.zsh/completions/_choice
+#        # in ~/.zshrc, before `autoload -Uz compinit && compinit`:
+#        #   fpath=(~/.zsh/completions $fpath)
+#
+# If the executable is named differently (e.g. choice.py), also register it:
+#   compdef _choice choice.py
+
+_choice() {
+    local curcontext="$curcontext" state line
+    typeset -A opt_args
+
+    _arguments -s -S \
+        '(-c --choices)'{-c,--choices}'[Characters allowed as choices (default YN)]:choices:' \
+        '(-n --no-prompt)'{-n,--no-prompt}'[Hide the list of choices]' \
+        '(-s --case-sensitive)'{-s,--case-sensitive}'[Case-sensitive matching]' \
+        '(-t --timeout)'{-t,--timeout}'[Seconds before the default is chosen (0-9999)]:seconds:' \
+        '(-d --default)'{-d,--default}'[Default choice used when the timeout expires]:default char:->defchar' \
+        '(-m --message)'{-m,--message}'[Message shown before the prompt]:message:' \
+        '(- *)'{-h,--help}'[Show help and exit]' \
+        '(- *)'{-V,--version}'[Show version and exit]'
+
+    case "$state" in
+        defchar)
+            # Offer the individual characters of the -c/--choices value already
+            # present on the command line, defaulting to the "YN" set.
+            local choices="YN"
+            if (( ${+opt_args[-c]} )); then
+                choices=${opt_args[-c]}
+            elif (( ${+opt_args[--choices]} )); then
+                choices=${opt_args[--choices]}
+            fi
+            local -a chars
+            local i
+            for (( i = 1; i <= ${#choices}; i++ )); do
+                chars+=("${choices[i]}")
+            done
+            _describe -t chars 'default choice' chars
+            ;;
+    esac
+}
+
+_choice "$@"
