@@ -1,0 +1,9 @@
+{
+  "icons": "always",
+  "color": "auto",
+  "sort": "name",
+  "group_directories_first": false,
+  "tree": false,
+  "git": false,
+  "summary": false
+}

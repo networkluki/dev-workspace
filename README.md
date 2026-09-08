@@ -20,6 +20,7 @@ exist.
 | `linux/` | Linux-specific commands, configuration examples, and operations notes |
 | `linux/windows-compat-commands/` | Linux CLI tools providing functionality inspired by familiar Windows commands (`assoc`, `choice`, `clip`, `pause`, `sfc`, `systeminfo`) |
 | `windows/` | Windows-specific commands, configuration examples, and operations notes |
+| [`windows/linux-compat-commands/exa/`](windows/linux-compat-commands/exa/) | Linux-inspired file listing for Windows with icons, colors, tree view, and Git status |
 | `docker/` | Dockerfiles, Compose examples, and container tooling |
 | `git/` | Git helpers and workflow notes |
 | `snippets/` | Small, reusable command and code snippets |
