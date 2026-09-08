@@ -21,6 +21,8 @@ exist.
 | `linux/windows-compat-commands/` | Linux CLI tools providing functionality inspired by familiar Windows commands (`assoc`, `choice`, `clip`, `pause`, `sfc`, `systeminfo`) |
 | `windows/` | Windows-specific commands, configuration examples, and operations notes |
 | [`windows/linux-compat-commands/exa/`](windows/linux-compat-commands/exa/) | Linux-inspired file listing for Windows with icons, colors, tree view, and Git status |
+| `android/` | Android-specific commands and utilities (e.g. Termux) |
+| [`android/termux-commands/`](android/termux-commands/) | Python-based CLI tools for Termux on Android: [`exa`](android/termux-commands/exa/) (modern `ls` replacement) and [`sysinfo`](android/termux-commands/sysinfo/) (`systeminfo` OS/hardware/network report) |
 | `docker/` | Dockerfiles, Compose examples, and container tooling |
 | `git/` | Git helpers and workflow notes |
 | `snippets/` | Small, reusable command and code snippets |
