@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+"""systeminfo - samlar in information om OS, hårdvara och nätverk.
+
+Använder endast Pythons standardbibliotek. Läser från /proc, /etc/os-release
+och plattforms-API:er. Skrivet för att degradera säkert när en källa saknas
+eller inte går att läsa (t.ex. i Termux/Android där vissa /proc-poster är
+begränsade).
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import platform
+import shutil
+import socket
+import struct
+import sys
+import time
+from typing import Any, Callable
+
+try:
+    import fcntl  # endast Unix; används för IPv4-adress via ioctl
+except ImportError:  # pragma: no cover - icke-Unix
+    fcntl = None  # type: ignore[assignment]
+
+__version__ = "1.1.0"
+
+
+def _safe(func: Callable[[], Any], default: Any = None) -> Any:
+    """Kör func och returnerar default vid vilket fel som helst."""
+    try:
+        return func()
+    except Exception:
+        return default
+
+
+def _read_file(path: str) -> str | None:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def read_os_release() -> dict[str, str]:
+    """Tolka /etc/os-release till en dict. Tom dict om filen saknas."""
+    result: dict[str, str] = {}
+    for path in ("/etc/os-release", "/usr/lib/os-release"):
+        content = _read_file(path)
+        if not content:
+            continue
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            result[key.strip()] = value.strip().strip('"').strip("'")
+        break
+    return result
+
+
+def get_uptime_seconds() -> float | None:
+    content = _read_file("/proc/uptime")
+    if not content:
+        return None
+    try:
+        return float(content.split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def format_duration(seconds: float | None) -> str | None:
+    if seconds is None:
+        return None
+    seconds = int(seconds)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def get_loadavg() -> tuple[float, float, float] | None:
+    return _safe(os.getloadavg)
+
+
+def get_cpu_info() -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "logical_cores": os.cpu_count(),
+        "architecture": platform.machine(),
+    }
+    content = _read_file("/proc/cpuinfo")
+    if content:
+        model = None
+        for line in content.splitlines():
+            if line.lower().startswith(("model name", "hardware", "processor\t")):
+                key, _, value = line.partition(":")
+                if "model name" in key.lower() or "hardware" in key.lower():
+                    model = value.strip()
+                    if "model name" in key.lower():
+                        break
+        if model:
+            info["model"] = model
+    return info
+
+
+def _parse_meminfo() -> dict[str, int]:
+    """Returnerar valda /proc/meminfo-fält i byte."""
+    content = _read_file("/proc/meminfo")
+    result: dict[str, int] = {}
+    if not content:
+        return result
+    for line in content.splitlines():
+        key, _, rest = line.partition(":")
+        parts = rest.split()
+        if not parts:
+            continue
+        try:
+            value_kb = int(parts[0])
+        except ValueError:
+            continue
+        result[key.strip()] = value_kb * 1024
+    return result
+
+
+def get_memory_info() -> dict[str, Any]:
+    mem = _parse_meminfo()
+    total = mem.get("MemTotal")
+    available = mem.get("MemAvailable")
+    used = None
+    if total is not None and available is not None:
+        used = total - available
+    return {
+        "total_bytes": total,
+        "available_bytes": available,
+        "used_bytes": used,
+        "swap_total_bytes": mem.get("SwapTotal"),
+        "swap_free_bytes": mem.get("SwapFree"),
+    }
+
+
+def get_disk_info(path: str = "/") -> dict[str, Any]:
+    usage = _safe(lambda: shutil.disk_usage(path))
+    if usage is None:
+        return {"path": path}
+    return {
+        "path": path,
+        "total_bytes": usage.total,
+        "used_bytes": usage.used,
+        "free_bytes": usage.free,
+    }
+
+
+def get_network_info() -> dict[str, Any]:
+    hostname = _safe(socket.gethostname)
+    fqdn = _safe(socket.getfqdn)
+    local_ip = None
+    # Bestäm utgående IP utan att skicka trafik (UDP-connect binder bara socket).
+    def _probe() -> str:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(1.0)
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+
+    local_ip = _safe(_probe)
+    return {"hostname": hostname, "fqdn": fqdn, "primary_ip": local_ip}
+
+
+def get_temperatures() -> list[dict[str, Any]]:
+    """Läser CPU/enhetstemperaturer från thermal-zoner och hwmon.
+
+    Returnerar en lista med {label, celsius}. Tom lista om inga källor är
+    läsbara (t.ex. begränsat /sys på Android).
+    """
+    sensors: list[dict[str, Any]] = []
+
+    # 1) /sys/class/thermal/thermal_zone*/{type,temp}
+    for zone in sorted(_safe(lambda: glob.glob("/sys/class/thermal/thermal_zone*")) or []):
+        raw = _read_file(os.path.join(zone, "temp"))
+        if not raw or not raw.strip().lstrip("-").isdigit():
+            continue
+        label = (_read_file(os.path.join(zone, "type")) or os.path.basename(zone)).strip()
+        milli = int(raw.strip())
+        sensors.append({"label": label, "celsius": round(milli / 1000.0, 1)})
+
+    # 2) /sys/class/hwmon/*/temp*_input (label från temp*_label eller name)
+    for inp in sorted(_safe(lambda: glob.glob("/sys/class/hwmon/*/temp*_input")) or []):
+        raw = _read_file(inp)
+        if not raw or not raw.strip().lstrip("-").isdigit():
+            continue
+        base = inp[: -len("_input")]
+        label = _read_file(base + "_label")
+        if not label:
+            chip = _read_file(os.path.join(os.path.dirname(inp), "name"))
+            label = (chip.strip() if chip else "hwmon") + " " + os.path.basename(base)
+        milli = int(raw.strip())
+        sensors.append({"label": label.strip(), "celsius": round(milli / 1000.0, 1)})
+
+    return sensors
+
+
+def _ipv4_of(ifname: str) -> str | None:
+    """Hämtar IPv4-adress för ett interface via SIOCGIFADDR (Linux)."""
+    if fcntl is None:
+        return None
+
+    def _query() -> str:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            packed = struct.pack("256s", ifname.encode("utf-8")[:15])
+            res = fcntl.ioctl(sock.fileno(), 0x8915, packed)  # SIOCGIFADDR
+            return socket.inet_ntoa(res[20:24])
+
+    return _safe(_query)
+
+
+def _ipv6_map() -> dict[str, list[str]]:
+    """Tolkar /proc/net/if_inet6 -> {ifname: [ipv6, ...]}."""
+    result: dict[str, list[str]] = {}
+    content = _read_file("/proc/net/if_inet6")
+    if not content:
+        return result
+    for line in content.splitlines():
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        hexaddr, ifname = parts[0], parts[5]
+        try:
+            packed = bytes.fromhex(hexaddr)
+            addr = socket.inet_ntop(socket.AF_INET6, packed)
+        except (ValueError, OSError):
+            continue
+        result.setdefault(ifname, []).append(addr)
+    return result
+
+
+def _iface_stats() -> dict[str, dict[str, int]]:
+    """Tolkar /proc/net/dev -> {ifname: {rx_bytes, tx_bytes}}."""
+    result: dict[str, dict[str, int]] = {}
+    content = _read_file("/proc/net/dev")
+    if not content:
+        return result
+    for line in content.splitlines():
+        if ":" not in line:
+            continue
+        name, _, rest = line.partition(":")
+        cols = rest.split()
+        if len(cols) < 9:
+            continue
+        try:
+            result[name.strip()] = {"rx_bytes": int(cols[0]), "tx_bytes": int(cols[8])}
+        except ValueError:
+            continue
+    return result
+
+
+def get_interfaces() -> list[dict[str, Any]]:
+    """Listar nätverksinterface med state, MAC, MTU, adresser och trafik.
+
+    Enumererar via socket.if_nameindex() och faller tillbaka till
+    /proc/net/dev om det inte är läsbart.
+    """
+    names: list[str] = []
+    idx = _safe(socket.if_nameindex)
+    if idx:
+        names = [name for _, name in idx]
+
+    stats = _iface_stats()
+    if not names:
+        names = list(stats.keys())
+
+    ipv6 = _ipv6_map()
+    interfaces: list[dict[str, Any]] = []
+    for name in sorted(set(names)):
+        sysbase = f"/sys/class/net/{name}"
+        state = _read_file(f"{sysbase}/operstate")
+        mac = _read_file(f"{sysbase}/address")
+        mtu = _read_file(f"{sysbase}/mtu")
+        st = stats.get(name, {})
+        interfaces.append({
+            "name": name,
+            "state": state.strip() if state else None,
+            "mac": mac.strip() if mac else None,
+            "mtu": int(mtu.strip()) if mtu and mtu.strip().isdigit() else None,
+            "ipv4": _ipv4_of(name),
+            "ipv6": ipv6.get(name, []),
+            "rx_bytes": st.get("rx_bytes"),
+            "tx_bytes": st.get("tx_bytes"),
+        })
+    return interfaces
+
+
+def collect() -> dict[str, Any]:
+    osr = read_os_release()
+    uptime = get_uptime_seconds()
+    load = get_loadavg()
+    return {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "os": {
+            "name": osr.get("PRETTY_NAME") or platform.system(),
+            "id": osr.get("ID"),
+            "version": osr.get("VERSION_ID") or osr.get("VERSION"),
+            "kernel": platform.release(),
+            "kernel_version": platform.version(),
+            "platform": platform.platform(),
+        },
+        "python": {
+            "version": platform.python_version(),
+            "implementation": platform.python_implementation(),
+            "executable": sys.executable,
+        },
+        "cpu": get_cpu_info(),
+        "memory": get_memory_info(),
+        "disk": get_disk_info("/"),
+        "network": get_network_info(),
+        "temperatures": get_temperatures(),
+        "interfaces": get_interfaces(),
+        "uptime": {
+            "seconds": uptime,
+            "human": format_duration(uptime),
+        },
+        "loadavg": {
+            "1m": load[0] if load else None,
+            "5m": load[1] if load else None,
+            "15m": load[2] if load else None,
+        },
+        "user": {
+            "name": _safe(lambda: os.environ.get("USER") or os.getlogin()),
+            "uid": _safe(os.getuid),
+            "gid": _safe(os.getgid),
+            "cwd": _safe(os.getcwd),
+        },
+    }
+
+
+def human_bytes(num: int | None) -> str:
+    if num is None:
+        return "N/A"
+    value = float(num)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if abs(value) < 1024.0:
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{value:.1f} EiB"
+
+
+def _fmt(value: Any) -> str:
+    return "N/A" if value is None else str(value)
+
+
+def convert_temp(celsius: float, unit: str) -> float:
+    """Konverterar Celsius till vald enhet ('c' eller 'f')."""
+    if unit == "f":
+        return round(celsius * 9.0 / 5.0 + 32.0, 1)
+    return round(celsius, 1)
+
+
+def render_text(data: dict[str, Any], temp_unit: str = "c") -> str:
+    o = data["os"]
+    cpu = data["cpu"]
+    mem = data["memory"]
+    disk = data["disk"]
+    net = data["network"]
+    load = data["loadavg"]
+    user = data["user"]
+
+    def pct(used: int | None, total: int | None) -> str:
+        if not used or not total:
+            return ""
+        return f" ({used / total * 100:.0f}%)"
+
+    lines = [
+        "===== SYSTEMINFO =====",
+        f"Tid          : {_fmt(data['timestamp'])}",
+        "",
+        "[ OS ]",
+        f"  Namn       : {_fmt(o['name'])}",
+        f"  Version    : {_fmt(o['version'])}",
+        f"  Kärna      : {_fmt(o['kernel'])}",
+        f"  Plattform  : {_fmt(o['platform'])}",
+        "",
+        "[ CPU ]",
+        f"  Modell     : {_fmt(cpu.get('model'))}",
+        f"  Arkitektur : {_fmt(cpu.get('architecture'))}",
+        f"  Kärnor     : {_fmt(cpu.get('logical_cores'))}",
+        f"  Load avg   : {_fmt(load['1m'])} / {_fmt(load['5m'])} / {_fmt(load['15m'])}",
+        "",
+        "[ MINNE ]",
+        f"  Totalt     : {human_bytes(mem['total_bytes'])}",
+        f"  Använt     : {human_bytes(mem['used_bytes'])}{pct(mem['used_bytes'], mem['total_bytes'])}",
+        f"  Tillgängl. : {human_bytes(mem['available_bytes'])}",
+        f"  Swap       : {human_bytes(mem['swap_free_bytes'])} fritt / {human_bytes(mem['swap_total_bytes'])}",
+        "",
+        "[ DISK / ]",
+        f"  Totalt     : {human_bytes(disk.get('total_bytes'))}",
+        f"  Använt     : {human_bytes(disk.get('used_bytes'))}{pct(disk.get('used_bytes'), disk.get('total_bytes'))}",
+        f"  Fritt      : {human_bytes(disk.get('free_bytes'))}",
+        "",
+        "[ NÄTVERK ]",
+        f"  Värdnamn   : {_fmt(net['hostname'])}",
+        f"  Primär IP  : {_fmt(net['primary_ip'])}",
+    ]
+
+    temps = data.get("temperatures") or []
+    unit_sym = "°F" if temp_unit == "f" else "°C"
+    lines.append("")
+    lines.append("[ TEMPERATUR ]")
+    if temps:
+        for sensor in temps:
+            value = convert_temp(sensor["celsius"], temp_unit)
+            lines.append(f"  {sensor['label']:<18}: {value:.1f} {unit_sym}")
+    else:
+        lines.append("  (inga läsbara sensorer)")
+
+    ifaces = data.get("interfaces") or []
+    lines.append("")
+    lines.append("[ INTERFACES ]")
+    if ifaces:
+        for iface in ifaces:
+            addrs = [a for a in [iface.get("ipv4")] if a] + list(iface.get("ipv6") or [])
+            addr_str = ", ".join(addrs) if addrs else "-"
+            lines.append(
+                f"  {iface['name']:<10} {_fmt(iface.get('state')):<6} "
+                f"MTU={_fmt(iface.get('mtu'))} "
+                f"RX={human_bytes(iface.get('rx_bytes'))} TX={human_bytes(iface.get('tx_bytes'))}"
+            )
+            lines.append(f"             MAC={_fmt(iface.get('mac'))}  addr={addr_str}")
+    else:
+        lines.append("  (inga läsbara interfaces)")
+
+    lines += [
+        "",
+        "[ SYSTEM ]",
+        f"  Upptid     : {_fmt(data['uptime']['human'])}",
+        f"  Användare  : {_fmt(user['name'])} (uid={_fmt(user['uid'])})",
+        f"  Python     : {_fmt(data['python']['version'])} ({_fmt(data['python']['implementation'])})",
+        "======================",
+    ]
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="systeminfo",
+        description="Samlar in och visar information om OS, hårdvara och nätverk.",
+    )
+    parser.add_argument(
+        "-V", "--version", action="version",
+        version=f"%(prog)s {__version__}",
+        help="Visa versionsnummer och avsluta.",
+    )
+    parser.add_argument(
+        "-j", "--json", action="store_true",
+        help="Skriv ut som JSON istället för text.",
+    )
+    parser.add_argument(
+        "--iface", action="append", metavar="NAMN", default=None,
+        help="Visa endast angivet interface. Kan upprepas (t.ex. --iface eth0 --iface wlan0).",
+    )
+    parser.add_argument(
+        "--temp-unit", choices=("c", "f"), default="c",
+        help="Temperaturenhet: c=Celsius (standard), f=Fahrenheit.",
+    )
+    parser.add_argument(
+        "--indent", type=int, default=2,
+        help="JSON-indentering (endast med --json). Standard: 2.",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        data = collect()
+    except Exception as exc:  # skydd mot oväntade fel; ska inte krascha användarens shell
+        print(f"systeminfo: kunde inte samla in data: {exc}", file=sys.stderr)
+        return 1
+
+    if args.iface:
+        wanted = set(args.iface)
+        available = {i["name"] for i in data.get("interfaces", [])}
+        missing = wanted - available
+        if missing:
+            print(
+                f"systeminfo: okänt interface: {', '.join(sorted(missing))} "
+                f"(tillgängliga: {', '.join(sorted(available)) or 'inga'})",
+                file=sys.stderr,
+            )
+            return 2
+        data["interfaces"] = [i for i in data["interfaces"] if i["name"] in wanted]
+
+    if args.json:
+        data["temperatures"] = [
+            {
+                "label": s["label"],
+                "value": convert_temp(s["celsius"], args.temp_unit),
+                "unit": args.temp_unit,
+            }
+            for s in data.get("temperatures", [])
+        ]
+        print(json.dumps(data, indent=args.indent, ensure_ascii=False))
+    else:
+        print(render_text(data, temp_unit=args.temp_unit))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,728 @@
+#!/usr/bin/env python3
+"""exa - en modern ersättare för `ls`.
+
+Listar filer och kataloger med färg, långt format, rutnät och trädvy.
+Använder **endast Pythons standardbibliotek** — inga externa beroenden.
+
+Designmål:
+- Degradera säkert när metadata inte går att läsa (t.ex. i Termux/Android
+  där uid/gid inte alltid går att slå upp till namn).
+- Behandla filnamn som otillförlitliga: kontrolltecken (inklusive ANSI-
+  escapesekvenser) saneras innan de skrivs till terminalen för att förhindra
+  terminal-escape-injektion via manipulerade filnamn.
+- Anropa inga externa kommandon (ingen risk för command injection).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import stat as stat_module
+import sys
+import time
+from typing import Any, Callable, Iterable
+
+try:
+    import pwd  # endast Unix; uid -> användarnamn
+except ImportError:  # pragma: no cover - icke-Unix
+    pwd = None  # type: ignore[assignment]
+
+try:
+    import grp  # endast Unix; gid -> gruppnamn
+except ImportError:  # pragma: no cover - icke-Unix
+    grp = None  # type: ignore[assignment]
+
+__version__ = "1.0.1"
+
+PROG = "exa"
+
+# ANSI-färgkoder. Tomma om färg är avstängd.
+RESET = "\x1b[0m"
+COLORS = {
+    "dir": "\x1b[1;34m",       # katalog: fet blå
+    "symlink": "\x1b[1;36m",   # symlänk: fet cyan
+    "broken": "\x1b[1;31m",    # trasig symlänk: fet röd
+    "exec": "\x1b[1;32m",      # körbar fil: fet grön
+    "socket": "\x1b[1;35m",    # socket: fet magenta
+    "fifo": "\x1b[33m",        # named pipe: gul
+    "device": "\x1b[1;33m",    # block-/teckenenhet: fet gul
+    "setuid": "\x1b[1;37;41m", # setuid/setgid: vit på röd
+    "size": "\x1b[0;32m",      # storlek: grön
+    "date": "\x1b[0;34m",      # datum: blå
+    "user": "\x1b[0;33m",      # ägare: gul
+    "perm_read": "\x1b[0;33m",
+    "perm_write": "\x1b[0;31m",
+    "perm_exec": "\x1b[0;32m",
+}
+
+
+def _safe(func: Callable[[], Any], default: Any = None) -> Any:
+    """Kör func och returnerar default vid vilket fel som helst."""
+    try:
+        return func()
+    except Exception:
+        return default
+
+
+def sanitize_name(name: str) -> str:
+    """Ersätter kontrolltecken i ett filnamn med '?'.
+
+    Filnamn är otillförlitlig indata. Ett filnamn som innehåller ANSI-
+    escapesekvenser kan annars manipulera terminalen (byta färg, flytta
+    markör, m.m.) när det skrivs ut. Vi ersätter alla tecken i C0/C1-
+    intervallen samt DEL.
+    """
+    out = []
+    for ch in name:
+        code = ord(ch)
+        if code < 0x20 or code == 0x7F or 0x80 <= code <= 0x9F:
+            out.append("?")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Metadata-insamling
+# ---------------------------------------------------------------------------
+
+
+def uid_name(uid: int) -> str:
+    if pwd is not None:
+        entry = _safe(lambda: pwd.getpwuid(uid))
+        if entry is not None:
+            return entry.pw_name
+    return str(uid)
+
+
+def gid_name(gid: int) -> str:
+    if grp is not None:
+        entry = _safe(lambda: grp.getgrgid(gid))
+        if entry is not None:
+            return entry.gr_name
+    return str(gid)
+
+
+def mode_to_string(mode: int) -> str:
+    """Bygger en `ls`-lik rättighetssträng, t.ex. '-rwxr-xr-x'."""
+    if stat_module.S_ISDIR(mode):
+        first = "d"
+    elif stat_module.S_ISLNK(mode):
+        first = "l"
+    elif stat_module.S_ISCHR(mode):
+        first = "c"
+    elif stat_module.S_ISBLK(mode):
+        first = "b"
+    elif stat_module.S_ISFIFO(mode):
+        first = "p"
+    elif stat_module.S_ISSOCK(mode):
+        first = "s"
+    else:
+        first = "-"
+
+    perms = ""
+    for who, r, w, x in (
+        ("u", stat_module.S_IRUSR, stat_module.S_IWUSR, stat_module.S_IXUSR),
+        ("g", stat_module.S_IRGRP, stat_module.S_IWGRP, stat_module.S_IXGRP),
+        ("o", stat_module.S_IROTH, stat_module.S_IWOTH, stat_module.S_IXOTH),
+    ):
+        perms += "r" if mode & r else "-"
+        perms += "w" if mode & w else "-"
+        # Setuid/setgid/sticky-bitar påverkar exec-positionen.
+        if who == "u" and mode & stat_module.S_ISUID:
+            perms += "s" if mode & x else "S"
+        elif who == "g" and mode & stat_module.S_ISGID:
+            perms += "s" if mode & x else "S"
+        elif who == "o" and mode & stat_module.S_ISVTX:
+            perms += "t" if mode & x else "T"
+        else:
+            perms += "x" if mode & x else "-"
+    return first + perms
+
+
+class Entry:
+    """En listad post med förbehandlad metadata."""
+
+    __slots__ = ("name", "path", "st", "lst", "link_target", "error")
+
+    def __init__(self, name: str, path: str) -> None:
+        self.name = name
+        self.path = path
+        self.error: str | None = None
+        # lst = lstat (följer ej symlänk), st = stat (följer symlänk).
+        self.lst = _safe(lambda: os.lstat(path))
+        if self.lst is None:
+            self.error = "kunde inte läsa metadata"
+            self.st = None
+            self.link_target = None
+            return
+        self.link_target = None
+        if stat_module.S_ISLNK(self.lst.st_mode):
+            self.link_target = _safe(lambda: os.readlink(path))
+            self.st = _safe(lambda: os.stat(path))  # None om trasig länk
+        else:
+            self.st = self.lst
+
+    @property
+    def is_dir(self) -> bool:
+        return self.st is not None and stat_module.S_ISDIR(self.st.st_mode)
+
+    @property
+    def is_symlink(self) -> bool:
+        return self.lst is not None and stat_module.S_ISLNK(self.lst.st_mode)
+
+    @property
+    def is_broken_link(self) -> bool:
+        return self.is_symlink and self.st is None
+
+    @property
+    def is_hidden(self) -> bool:
+        return self.name.startswith(".")
+
+    @property
+    def size(self) -> int:
+        return self.lst.st_size if self.lst is not None else 0
+
+    @property
+    def mtime(self) -> float:
+        return self.lst.st_mtime if self.lst is not None else 0.0
+
+    @property
+    def extension(self) -> str:
+        base = self.name.lstrip(".")
+        _, dot, ext = base.rpartition(".")
+        return ext.lower() if dot else ""
+
+    def color(self) -> str:
+        """Returnerar färgnyckel enligt filtyp."""
+        if self.is_broken_link:
+            return "broken"
+        if self.is_symlink:
+            return "symlink"
+        if self.lst is None:
+            return ""
+        mode = self.lst.st_mode
+        if stat_module.S_ISDIR(mode):
+            return "dir"
+        if stat_module.S_ISSOCK(mode):
+            return "socket"
+        if stat_module.S_ISFIFO(mode):
+            return "fifo"
+        if stat_module.S_ISCHR(mode) or stat_module.S_ISBLK(mode):
+            return "device"
+        if mode & (stat_module.S_ISUID | stat_module.S_ISGID):
+            return "setuid"
+        if mode & (stat_module.S_IXUSR | stat_module.S_IXGRP | stat_module.S_IXOTH):
+            return "exec"
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Sortering
+# ---------------------------------------------------------------------------
+
+
+SORT_KEYS: dict[str, Callable[[Entry], Any]] = {
+    "name": lambda e: e.name.lower(),
+    "size": lambda e: e.size,
+    "modified": lambda e: e.mtime,
+    "type": lambda e: (not e.is_dir, e.name.lower()),
+    "extension": lambda e: (e.extension, e.name.lower()),
+    "none": lambda e: 0,
+}
+
+
+def sort_entries(entries: list[Entry], key: str, reverse: bool, dirs_first: bool) -> list[Entry]:
+    if key in SORT_KEYS and key != "none":
+        entries = sorted(entries, key=SORT_KEYS[key], reverse=reverse)
+    elif reverse:
+        entries = list(reversed(entries))
+    if dirs_first:
+        entries = sorted(entries, key=lambda e: not e.is_dir)
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# Formatering
+# ---------------------------------------------------------------------------
+
+
+def human_bytes(num: int, binary: bool = True) -> str:
+    """Människoläsbar storlek. Binärt (KiB) som standard."""
+    step = 1024.0 if binary else 1000.0
+    units = (
+        ("", "K", "M", "G", "T", "P")
+        if not binary
+        else ("", "Ki", "Mi", "Gi", "Ti", "Pi")
+    )
+    value = float(num)
+    for unit in units:
+        if abs(value) < step:
+            if unit == "":
+                return f"{int(value)}"
+            return f"{value:.1f}{unit}"
+        value /= step
+    return f"{value:.1f}E"
+
+
+def format_time(ts: float) -> str:
+    """Formaterar mtime likt `ls`: 'mån dag tid' eller 'mån dag år'."""
+    now = time.time()
+    lt = time.localtime(ts)
+    # Äldre än ~6 månader visar år istället för klockslag.
+    if abs(now - ts) > 15552000:
+        return time.strftime("%d %b  %Y", lt)
+    return time.strftime("%d %b %H:%M", lt)
+
+
+class Painter:
+    """Applicerar (eller utelämnar) ANSI-färg."""
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def paint(self, text: str, key: str) -> str:
+        if not self.enabled or not key or key not in COLORS:
+            return text
+        return f"{COLORS[key]}{text}{RESET}"
+
+    def paint_perms(self, perm_str: str) -> str:
+        if not self.enabled:
+            return perm_str
+        out = []
+        for ch in perm_str:
+            if ch == "r":
+                out.append(f"{COLORS['perm_read']}{ch}{RESET}")
+            elif ch == "w":
+                out.append(f"{COLORS['perm_write']}{ch}{RESET}")
+            elif ch in "xsStT":
+                out.append(f"{COLORS['perm_exec']}{ch}{RESET}")
+            else:
+                out.append(ch)
+        return "".join(out)
+
+
+def display_name(entry: Entry, painter: Painter, classify: bool) -> str:
+    """Renderar postens namn med färg, ev. typindikator och symlänkmål."""
+    name = sanitize_name(entry.name)
+    suffix = ""
+    if classify:
+        if entry.is_dir:
+            suffix = "/"
+        elif entry.is_symlink:
+            suffix = "@"
+        elif entry.lst is not None and entry.lst.st_mode & (
+            stat_module.S_IXUSR | stat_module.S_IXGRP | stat_module.S_IXOTH
+        ):
+            suffix = "*"
+    painted = painter.paint(name, entry.color()) + suffix
+    if entry.is_symlink and entry.link_target is not None:
+        target = sanitize_name(entry.link_target)
+        arrow_color = "broken" if entry.is_broken_link else "symlink"
+        painted += " -> " + painter.paint(target, arrow_color)
+    return painted
+
+
+def visible_len(entry: Entry, classify: bool) -> int:
+    """Synlig bredd på namnet (utan ANSI, utan symlänkmål)."""
+    length = len(sanitize_name(entry.name))
+    if classify and (entry.is_dir or entry.is_symlink):
+        length += 1
+    elif classify and entry.lst is not None and entry.lst.st_mode & (
+        stat_module.S_IXUSR | stat_module.S_IXGRP | stat_module.S_IXOTH
+    ):
+        length += 1
+    return length
+
+
+def render_long(
+    entries: list[Entry],
+    painter: Painter,
+    args: argparse.Namespace,
+) -> list[str]:
+    """Långt format: rättigheter, länkar, ägare, grupp, storlek, datum, namn."""
+    # Beräkna kolumnbredder utifrån ofärgad text.
+    widths = [0, 0, 0, 0, 0, 0]
+    plain_rows: list[tuple[str, ...]] = []
+    for e in entries:
+        if e.lst is None:
+            plain = ("?", "?", "?", "?", "?", "?")
+        else:
+            plain = (
+                mode_to_string(e.lst.st_mode),
+                str(e.lst.st_nlink),
+                uid_name(e.lst.st_uid),
+                gid_name(e.lst.st_gid),
+                str(e.size) if args.bytes else human_bytes(e.size, binary=not args.si),
+                format_time(e.mtime),
+            )
+        plain_rows.append(plain)
+        for i in range(6):
+            widths[i] = max(widths[i], len(plain[i]))
+
+    headers = ("Permissions", "Links", "User", "Group", "Size", "Modified", "Name")
+    if args.header:
+        # Låt kolumnerna rymma rubrikerna så att allt förblir justerat.
+        for i in range(6):
+            widths[i] = max(widths[i], len(headers[i]))
+
+    lines: list[str] = []
+    if args.header:
+        head = (
+            f"{headers[0]:<{widths[0]}} {headers[1]:>{widths[1]}} "
+            f"{headers[2]:<{widths[2]}} {headers[3]:<{widths[3]}} "
+            f"{headers[4]:>{widths[4]}} {headers[5]:<{widths[5]}} {headers[6]}"
+        )
+        lines.append(head)
+
+    for e, plain in zip(entries, plain_rows):
+        perms_disp = painter.paint_perms(plain[0])
+        size_disp = painter.paint(plain[4], "size")
+        date_disp = painter.paint(plain[5], "date")
+        owner_disp = painter.paint(plain[2], "user")
+        # Padda på ofärgad text, färglägg sedan.
+        perms_pad = perms_disp + " " * (widths[0] - len(plain[0]))
+        owner_pad = owner_disp + " " * (widths[2] - len(plain[2]))
+        size_pad = " " * (widths[4] - len(plain[4])) + size_disp
+        name_disp = display_name(e, painter, args.classify)
+        line = (
+            f"{perms_pad} {plain[1]:>{widths[1]}} "
+            f"{owner_pad} {plain[3]:<{widths[3]}} "
+            f"{size_pad} {date_disp} {name_disp}"
+        )
+        lines.append(line)
+    return lines
+
+
+def render_grid(
+    entries: list[Entry],
+    painter: Painter,
+    args: argparse.Namespace,
+    term_width: int,
+) -> list[str]:
+    """Rutnätsvy (kolumner) som fyller terminalbredden."""
+    if not entries:
+        return []
+    names_visible = [visible_len(e, args.classify) for e in entries]
+    names_display = [display_name(e, painter, args.classify) for e in entries]
+    max_name = max(names_visible)
+    gap = 2
+    col_width = max_name + gap
+    ncols = max(1, min(len(entries), term_width // col_width))
+
+    # Kolumnvis fyllning (som `ls`): beräkna antal rader.
+    nrows = (len(entries) + ncols - 1) // ncols
+    # Justera kolumnantal nedåt om sista raden lämnar tomma kolumner.
+    while ncols > 1 and (nrows * (ncols - 1)) >= len(entries):
+        ncols -= 1
+        nrows = (len(entries) + ncols - 1) // ncols
+
+    lines: list[str] = []
+    for r in range(nrows):
+        parts: list[str] = []
+        for c in range(ncols):
+            idx = c * nrows + r
+            if idx >= len(entries):
+                continue
+            pad = col_width - names_visible[idx]
+            is_last = (c == ncols - 1) or (idx + nrows >= len(entries))
+            if is_last:
+                parts.append(names_display[idx])
+            else:
+                parts.append(names_display[idx] + " " * pad)
+        lines.append("".join(parts).rstrip())
+    return lines
+
+
+def render_oneline(entries: list[Entry], painter: Painter, args: argparse.Namespace) -> list[str]:
+    return [display_name(e, painter, args.classify) for e in entries]
+
+
+# ---------------------------------------------------------------------------
+# Trädvy
+# ---------------------------------------------------------------------------
+
+
+def render_tree(
+    path: str,
+    painter: Painter,
+    args: argparse.Namespace,
+    out: list[str],
+    prefix: str = "",
+    depth: int = 0,
+) -> None:
+    """Rekursiv trädvy med grafiska grenar."""
+    if args.level is not None and depth >= args.level:
+        return
+    try:
+        raw = os.listdir(path)
+    except OSError as exc:
+        out.append(prefix + f"[fel: {exc.strerror}]")
+        return
+    entries = build_entries(path, raw, args)
+    entries = sort_entries(entries, args.sort, args.reverse, args.dirs_first)
+    for i, e in enumerate(entries):
+        last = i == len(entries) - 1
+        branch = "└── " if last else "├── "
+        out.append(prefix + branch + display_name(e, painter, args.classify))
+        if e.is_dir and not e.is_symlink:
+            extension = "    " if last else "│   "
+            render_tree(e.path, painter, args, out, prefix + extension, depth + 1)
+
+
+# ---------------------------------------------------------------------------
+# Insamling / listning
+# ---------------------------------------------------------------------------
+
+
+def build_entries(base: str, names: Iterable[str], args: argparse.Namespace) -> list[Entry]:
+    entries: list[Entry] = []
+    for name in names:
+        if not args.all and name.startswith("."):
+            continue
+        if args.almost_all and name in (".", ".."):
+            continue
+        entries.append(Entry(name, os.path.join(base, name)))
+    return entries
+
+
+def entry_to_dict(e: Entry, args: argparse.Namespace) -> dict[str, Any]:
+    d: dict[str, Any] = {"name": e.name, "path": e.path}
+    if e.error:
+        d["error"] = e.error
+        return d
+    lst = e.lst
+    d.update({
+        "type": mode_to_string(lst.st_mode)[0],
+        "permissions": mode_to_string(lst.st_mode),
+        "mode_octal": oct(stat_module.S_IMODE(lst.st_mode)),
+        "links": lst.st_nlink,
+        "uid": lst.st_uid,
+        "gid": lst.st_gid,
+        "user": uid_name(lst.st_uid),
+        "group": gid_name(lst.st_gid),
+        "size_bytes": e.size,
+        "mtime_epoch": lst.st_mtime,
+        "mtime_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(lst.st_mtime)),
+        "is_dir": e.is_dir,
+        "is_symlink": e.is_symlink,
+    })
+    if e.is_symlink:
+        d["link_target"] = e.link_target
+        d["broken"] = e.is_broken_link
+    return d
+
+
+def list_path(
+    path: str,
+    painter: Painter,
+    args: argparse.Namespace,
+    term_width: int,
+) -> tuple[list[str], list[dict[str, Any]], int]:
+    """Listar en sökväg. Returnerar (textrader, json-poster, exitkod)."""
+    exit_code = 0
+    st = _safe(lambda: os.lstat(path))
+    if st is None:
+        return ([f"{PROG}: kan inte komma åt '{sanitize_name(path)}': ingen sådan fil eller katalog"], [], 2)
+
+    is_dir = stat_module.S_ISDIR(st.st_mode)
+    # Med -d, eller om målet inte är en katalog: lista posten själv.
+    if args.dirs or not is_dir:
+        entries = [Entry(path, path)]
+    else:
+        raw = _safe(lambda: os.listdir(path))
+        if raw is None:
+            return ([f"{PROG}: kan inte öppna katalog '{sanitize_name(path)}': åtkomst nekad"], [], 2)
+        entries = build_entries(path, raw, args)
+        entries = sort_entries(entries, args.sort, args.reverse, args.dirs_first)
+
+    if args.json:
+        return ([], [entry_to_dict(e, args) for e in entries], exit_code)
+
+    if args.long:
+        return (render_long(entries, painter, args), [], exit_code)
+    if args.oneline:
+        return (render_oneline(entries, painter, args), [], exit_code)
+    return (render_grid(entries, painter, args, term_width), [], exit_code)
+
+
+def render_entries(
+    entries: list[Entry],
+    painter: Painter,
+    args: argparse.Namespace,
+    term_width: int,
+) -> list[str]:
+    """Renderar en färdig lista av poster enligt valt visningsläge."""
+    if args.long:
+        return render_long(entries, painter, args)
+    if args.oneline:
+        return render_oneline(entries, painter, args)
+    return render_grid(entries, painter, args, term_width)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=PROG,
+        description="En modern ersättare för ls: listar filer och kataloger.",
+    )
+    p.add_argument("paths", nargs="*", default=["."], metavar="SÖKVÄG",
+                   help="En eller flera sökvägar att lista. Standard: aktuell katalog.")
+    p.add_argument("-V", "--version", "-version", action="version",
+                   version=f"%(prog)s {__version__}",
+                   help="Visa versionsnummer och avsluta.")
+
+    view = p.add_argument_group("visningslägen")
+    view.add_argument("-l", "--long", action="store_true",
+                      help="Långt format med rättigheter, ägare, storlek och datum.")
+    view.add_argument("-1", "--oneline", action="store_true",
+                      help="En post per rad.")
+    view.add_argument("-T", "--tree", action="store_true",
+                      help="Visa som ett träd.")
+    view.add_argument("-L", "--level", type=int, metavar="DJUP", default=None,
+                      help="Maximalt rekursionsdjup för trädvy (-T).")
+    view.add_argument("-j", "--json", action="store_true",
+                      help="Skriv ut som JSON istället för text.")
+
+    filt = p.add_argument_group("filter")
+    filt.add_argument("-a", "--all", action="store_true",
+                      help="Visa även dolda poster (som börjar med punkt).")
+    filt.add_argument("-A", "--almost-all", action="store_true",
+                      help="Som --all men utan '.' och '..'.")
+    filt.add_argument("-d", "--dirs", action="store_true",
+                      help="Lista kataloger själva, inte deras innehåll.")
+
+    sort = p.add_argument_group("sortering")
+    sort.add_argument("-s", "--sort", default="name",
+                      choices=("name", "size", "modified", "type", "extension", "none"),
+                      help="Sorteringsnyckel. Standard: name.")
+    sort.add_argument("-r", "--reverse", action="store_true",
+                      help="Omvänd sorteringsordning.")
+    sort.add_argument("--dirs-first", action="store_true",
+                      help="Visa kataloger före filer.")
+
+    fmt = p.add_argument_group("formatering")
+    fmt.add_argument("-F", "--classify", action="store_true",
+                     help="Lägg till typindikator (/, @, *) efter namn.")
+    fmt.add_argument("-H", "--header", action="store_true",
+                     help="Visa kolumnrubrik i långt format (-l).")
+    fmt.add_argument("--bytes", action="store_true",
+                     help="Visa storlek i råa byte istället för människoläsbart.")
+    fmt.add_argument("--si", action="store_true",
+                     help="Använd SI-enheter (1000) istället för binära (1024).")
+    fmt.add_argument("--color", choices=("auto", "always", "never"), default="auto",
+                     help="När färg ska användas. Standard: auto (endast i terminal).")
+    fmt.add_argument("--indent", type=int, default=2,
+                     help="JSON-indentering (endast med --json). Standard: 2.")
+    return p
+
+
+def resolve_color(mode: str) -> bool:
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    return sys.stdout.isatty()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    # -A implicerar att dolda visas.
+    if args.almost_all:
+        args.all = True
+
+    painter = Painter(resolve_color(args.color))
+    term_width = _safe(lambda: os.get_terminal_size().columns, 80) or 80
+
+    exit_code = 0
+    multiple = len(args.paths) > 1
+
+    # JSON-utdata samlas och skrivs som ett objekt.
+    if args.json:
+        result: dict[str, Any] = {}
+        for path in args.paths:
+            lines, items, code = list_path(path, painter, args, term_width)
+            exit_code = max(exit_code, code)
+            if code != 0:
+                result[path] = {"error": " ".join(lines)}
+            else:
+                result[path] = items
+        payload = result if multiple else next(iter(result.values()), [])
+        print(json.dumps(payload, indent=args.indent, ensure_ascii=False))
+        return exit_code
+
+    # Trädvy hanteras separat per sökväg.
+    if args.tree:
+        for i, path in enumerate(args.paths):
+            if multiple or i == 0:
+                header = sanitize_name(path)
+                print(painter.paint(header, "dir"))
+            out: list[str] = []
+            render_tree(path, painter, args, out)
+            print("\n".join(out))
+        return exit_code
+
+    # Dela argumenten i "lösa" poster (filer, eller allt med -d) och kataloger
+    # som ska expanderas — precis som `ls`.
+    loose: list[Entry] = []
+    dirs: list[str] = []
+    for path in args.paths:
+        st = _safe(lambda p=path: os.lstat(p))
+        if st is None:
+            print(
+                f"{PROG}: kan inte komma åt '{sanitize_name(path)}': "
+                f"ingen sådan fil eller katalog",
+                file=sys.stderr,
+            )
+            exit_code = max(exit_code, 2)
+            continue
+        if args.dirs or not stat_module.S_ISDIR(st.st_mode):
+            loose.append(Entry(path, path))
+        else:
+            dirs.append(path)
+
+    blocks: list[list[str]] = []
+    if loose:
+        loose = sort_entries(loose, args.sort, args.reverse, args.dirs_first)
+        blocks.append(render_entries(loose, painter, args, term_width))
+
+    label_dirs = len(dirs) > 1 or (loose and dirs)
+    for path in dirs:
+        raw = _safe(lambda p=path: os.listdir(p))
+        if raw is None:
+            print(
+                f"{PROG}: kan inte öppna katalog '{sanitize_name(path)}': åtkomst nekad",
+                file=sys.stderr,
+            )
+            exit_code = max(exit_code, 2)
+            continue
+        entries = build_entries(path, raw, args)
+        entries = sort_entries(entries, args.sort, args.reverse, args.dirs_first)
+        body = render_entries(entries, painter, args, term_width)
+        if label_dirs:
+            body = [painter.paint(sanitize_name(path) + ":", "dir"), *body]
+        blocks.append(body)
+
+    output = "\n\n".join("\n".join(b) for b in blocks if b)
+    if output:
+        print(output)
+    return exit_code
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except BrokenPipeError:  # t.ex. `exa | head`
+        try:
+            sys.stdout.close()
+        finally:
+            os._exit(0)
+    except KeyboardInterrupt:
+        os._exit(130)
