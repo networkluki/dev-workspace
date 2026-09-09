@@ -19,6 +19,7 @@ compatibility — they reproduce the *purpose* and, where practical, the
 | [`assoc`](#assoc) | `assoc` | Map a file extension to a type (MIME type on Linux) | 1.0.0 |
 | [`choice`](#choice) | `CHOICE` | Single-key menu selection returned as the exit code | 1.1.0 |
 | [`clip`](#clip) | `clip` | Copy standard input to the system clipboard | 1.0.0 |
+| [`ipconfig`](#ipconfig) | `ipconfig` | Show per-adapter TCP/IP configuration | 1.0.0 |
 | [`pause`](#pause) | `pause` | Wait for a single keypress | 1.0.0 |
 | [`sfc`](#sfc) | `sfc /scannow` | Verify/repair system files via the package manager | 1.0.0 |
 | [`systeminfo`](#systeminfo) | `systeminfo` | Report host, OS, hardware, and network information | 1.4.0 |
@@ -132,6 +133,46 @@ complete per-command reference.
 - **Differences from Windows:** behaviourally equivalent for the copy use case.
   Exit codes: `0` success, `1` backend failure, `2` no backend available.
 
+## ipconfig
+
+- **Original Windows command:** `ipconfig` — displays the TCP/IP network
+  configuration per adapter; `ipconfig /all` shows full detail.
+- **Linux implementation:** reads the iproute2 JSON interface (`ip -j addr`,
+  `ip -j route`) and `/etc/resolv.conf`, then renders the data in the familiar
+  Windows layout. **Read-only** — it inspects and prints network state, it never
+  changes it.
+- **Purpose:** a quick, Windows-style per-adapter view of addresses, masks,
+  gateways, and DNS.
+- **Syntax:**
+  ```
+  ipconfig                     Basic per-adapter IPv4/IPv6, subnet mask, gateway
+  ipconfig --all               Add MAC address, DHCP status, DNS servers
+  ipconfig --version | --help
+  ```
+  Windows-style switches are also accepted (`/all`, `/version`, `/?`).
+- **Examples:**
+  ```console
+  $ ipconfig
+  Wireless LAN adapter wlo1:
+     IPv4 Address. . . . . . . . . . . : 192.168.0.19(Preferred)
+     Subnet Mask . . . . . . . . . . . : 255.255.255.0
+     Default Gateway . . . . . . . . . : 192.168.0.1
+  $ ipconfig /all      # adds Physical Address, DHCP Enabled, DNS Servers
+  ```
+- **Dependencies:** Python 3.9+ and `iproute2` (the `ip` command); no
+  third-party packages.
+- **Privilege requirements:** none (all data sources are readable by a normal
+  user).
+- **Limitations:** **DHCP Enabled** is inferred from the kernel `dynamic` flag
+  on an address, not queried from the network manager. **DNS Servers/suffix**
+  come from `/etc/resolv.conf`, which under `systemd-resolved` may point at the
+  local stub (`127.0.0.53`); use `resolvectl status` for per-link detail. The
+  stateful switches `/release`, `/renew`, and `/flushdns` are **not**
+  implemented (those are handled by the specific Linux network manager).
+- **Differences from Windows:** the output layout mirrors Windows, but the data
+  sources are Linux-native (iproute2 + resolv.conf) and the tool never mutates
+  network state. Exit codes: `0` success, `1` runtime error (e.g. `ip` missing).
+
 ## pause
 
 - **Original Windows command:** `pause` — prints a prompt and waits for any key.
@@ -236,7 +277,7 @@ cd clip        # or assoc
 pip install .
 ```
 
-**Single-file scripts** (`choice`, `pause`, `sfc`, `systeminfo`):
+**Single-file scripts** (`choice`, `ipconfig`, `pause`, `sfc`, `systeminfo`):
 
 ```bash
 install -m 0755 systeminfo/systeminfo ~/.local/bin/systeminfo   # example

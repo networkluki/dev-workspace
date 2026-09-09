@@ -12,6 +12,12 @@ release.
 
 ## [Unreleased]
 
+### Added
+
+- `ipconfig` **1.0.0** — Windows-style per-adapter TCP/IP configuration built on
+  iproute2 (`ip -j`) and `/etc/resolv.conf`; read-only, with `--all`/`/all`
+  detail view (inspired by Windows `ipconfig`).
+
 ## [1.0.0] - 2026-09-07
 
 ### Added
